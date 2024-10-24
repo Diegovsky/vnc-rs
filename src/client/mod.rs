@@ -1,7 +1,7 @@
 mod auth;
 pub mod connection;
 pub mod connector;
-mod messages;
+pub mod messages;
 mod security;
 
 pub use connection::VncClient;

@@ -1,4 +1,4 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{ImageData, PixelFormat, Rect, VncError, VncEvent};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -11,17 +11,14 @@ impl Decoder {
         Self {}
     }
 
-    pub async fn decode<S, F, Fut>(
+    pub async fn decode<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let _hotx = rect.x;
         let _hoty = rect.y;
@@ -73,8 +70,6 @@ impl Decoder {
             }
         }
 
-        output_func(VncEvent::SetCursor(*rect, image)).await?;
-
-        Ok(())
+        Ok(VncEvent::SetCursor(ImageData::new(*rect, image)))
     }
 }

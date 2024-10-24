@@ -143,9 +143,9 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let tcp = TcpStream::connect("127.0.0.1:5900").await?;
+    let tcp = TcpStream::connect(std::env::args().nth(1).expect("Need ip as first argument")).await?;
     let vnc = VncConnector::new(tcp)
-        .set_auth_method(async move { Ok("123".to_string()) })
+        .set_auth_method(async move { Ok("Ledi1691".to_string()) })
         .add_encoding(vnc::VncEncoding::Tight)
         .add_encoding(vnc::VncEncoding::Zrle)
         .add_encoding(vnc::VncEncoding::CopyRect)
@@ -154,8 +154,7 @@ async fn main() -> Result<()> {
         .set_pixel_format(PixelFormat::bgra())
         .build()?
         .try_start()
-        .await?
-        .finish()?;
+        .await?;
 
     let mut canvas = CanvasUtils::new()?;
 

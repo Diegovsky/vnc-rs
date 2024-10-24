@@ -1,4 +1,4 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncImageEvent};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
@@ -50,17 +50,15 @@ impl Decoder {
         }
     }
 
-    pub async fn decode<S, F, Fut>(
+    pub async fn decode<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
+        frames: &mut Vec<VncImageEvent>
     ) -> Result<(), VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let data_len = input.read_u32().await? as usize;
         let mut zlib_data = uninit_vec(data_len);
@@ -78,7 +76,7 @@ impl Decoder {
                 if pixel_mask & 0x000000ff == 0 {
                     // rgb at the most significant bits
                     // if format.big_endian_flag is set
-                    // then decompressed data is excepted to be [rgb.0, rgb.1, rgb.2, alpha]
+                    // then decompressed data is expected to be [rgb.0, rgb.1, rgb.2, alpha]
                     // otherwise the decompressed data should be [alpha, rgb.0, rgb.1, rgb.2]
                     (3, format.big_endian_flag == 0)
                 } else if pixel_mask & 0xff000000 == 0 {
@@ -217,16 +215,15 @@ impl Decoder {
                         return Err(VncError::InvalidImageData);
                     }
                 }
-                output_func(VncEvent::RawImage(
-                    Rect {
+                frames.push(VncImageEvent::RawImage(
+                    crate::ImageData::new(Rect {
                         x: rect.x + x,
                         y: rect.y + y,
                         width,
                         height,
                     },
-                    pixels,
-                ))
-                .await?;
+                    pixels,)
+                ));
                 x += width;
             }
             y += height;

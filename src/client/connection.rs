@@ -1,23 +1,19 @@
-use futures::TryStreamExt;
-use tokio_stream::wrappers::ReceiverStream;
-
-use std::{future::Future, sync::Arc, vec};
+use std::{alloc::{Allocator, Global}, sync::Arc, vec};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{
         mpsc::{
             channel,
-            error::{TryRecvError, TrySendError},
+            error::TryRecvError,
             Receiver, Sender,
         },
         oneshot, Mutex,
     },
 };
-use tokio_util::compat::*;
 use tracing::*;
 
-use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event};
-const CHANNEL_SIZE: usize = 4096;
+use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, VncImageEvent, ClientEvent};
+const CHANNEL_SIZE: usize = 128;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::spawn;
@@ -50,6 +46,7 @@ impl From<[u8; 12]> for ImageRect {
 }
 
 impl ImageRect {
+    #[inline]
     async fn read<S>(reader: &mut S) -> Result<Self, VncError>
     where
         S: AsyncRead + Unpin,
@@ -60,20 +57,19 @@ impl ImageRect {
     }
 }
 
-struct VncInner {
+pub struct VncClient {
     name: String,
     screen: (u16, u16),
-    input_ch: Sender<ClientMsg>,
-    output_ch: Receiver<VncEvent>,
-    decoding_stop: Option<oneshot::Sender<()>>,
-    net_conn_stop: Option<oneshot::Sender<()>>,
+    watch_close: tokio::sync::watch::Sender<bool>,
+    client_tx: Sender<ClientEvent>,
+    server_rx: Receiver<VncEvent>,
     closed: bool,
 }
 
 /// The instance of a connected vnc client
 
-impl VncInner {
-    async fn new<S>(
+impl VncClient {
+    pub(crate) async fn new<S>(
         mut stream: S,
         shared: bool,
         mut pixel_format: Option<PixelFormat>,
@@ -82,224 +78,131 @@ impl VncInner {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (conn_ch_tx, conn_ch_rx) = channel(CHANNEL_SIZE);
-        let (input_ch_tx, input_ch_rx) = channel(CHANNEL_SIZE);
-        let (output_ch_tx, output_ch_rx) = channel(CHANNEL_SIZE);
-        let (decoding_stop_tx, decoding_stop_rx) = oneshot::channel();
-        let (net_conn_stop_tx, net_conn_stop_rx) = oneshot::channel();
+        let (client_tx, mut input_ch_rx) = channel::<ClientEvent>(CHANNEL_SIZE);
+        let (server_tx, server_rx) = channel(1);
+        let (watch_close_tx, watch_close_rx) = tokio::sync::watch::channel(false);
 
         trace!("client init msg");
-        send_client_init(&mut stream, shared).await?;
+        trace!("Send shared flag: {}", shared);
+        stream.write_u8(shared as u8).await?;
 
         trace!("server init msg");
         let (name, (width, height)) =
-            read_server_init(&mut stream, &mut pixel_format, &|e| async {
-                output_ch_tx.send(e).await?;
-                Ok(())
-            })
+            read_server_init(&mut stream, &mut pixel_format, &server_tx)
             .await?;
 
         trace!("client encodings: {:?}", encodings);
         send_client_encoding(&mut stream, encodings).await?;
 
         trace!("Require the first frame");
-        input_ch_tx
-            .send(ClientMsg::FramebufferUpdateRequest(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                0,
-            ))
-            .await?;
+        ClientMsg::FramebufferUpdateRequest(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            0,
+        ).write(&mut stream).await?;
 
         // start the decoding thread
         spawn(async move {
-            trace!("Decoding thread starts");
-            let mut conn_ch_rx = {
-                let conn_ch_rx = ReceiverStream::new(conn_ch_rx).into_async_read();
-                FuturesAsyncReadCompatExt::compat(conn_ch_rx)
-            };
-
-            let output_func = |e| async {
-                output_ch_tx.send(e).await?;
-                Ok(())
-            };
-
+            trace!("IO thread starts");
             let pf = pixel_format.as_ref().unwrap();
-            if let Err(e) =
-                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, decoding_stop_rx).await
-            {
-                if let VncError::IoError(e) = e {
-                    if let std::io::ErrorKind::UnexpectedEof = e.kind() {
-                        // this should be a normal case when the network connection disconnects
-                        // and we just send an EOF over the inner bridge between the process thread and the decode thread
-                        // do nothing here
-                    } else {
-                        error!("Error occurs during the decoding {:?}", e);
-                        let _ = output_func(VncEvent::Error(e.to_string())).await;
+            let mut reader = Reader::new();
+            loop {
+                if *watch_close_rx.borrow() {
+                    break;
+                }
+                let result: Result<(), VncError> = try {
+                    info!("Waiting for event");
+                    reader.read_vnc_event(&mut stream, pf, &server_tx).await?;
+                    match input_ch_rx.try_recv() {
+                        Ok(event) => event.into_msg(width, height).write(&mut stream).await?,
+                        Err(TryRecvError::Empty) => () ,
+                        _ => unreachable!(),
                     }
-                } else {
-                    error!("Error occurs during the decoding {:?}", e);
-                    let _ = output_func(VncEvent::Error(e.to_string())).await;
+                };
+                if let Err(e) = result {
+                    server_tx.send(VncEvent::Error(e.to_string())).await.unwrap();
+                    break
                 }
             }
-            trace!("Decoding thread stops");
-        });
-
-        // start the traffic process thread
-        spawn(async move {
-            trace!("Net Connection thread starts");
-            let _ =
-                async_connection_process_loop(stream, input_ch_rx, conn_ch_tx, net_conn_stop_rx)
-                    .await;
-            trace!("Net Connection thread stops");
+            trace!("IO thread stops");
         });
 
         info!("VNC Client {name} starts");
         Ok(Self {
             name,
             screen: (width, height),
-            input_ch: input_ch_tx,
-            output_ch: output_ch_rx,
-            decoding_stop: Some(decoding_stop_tx),
-            net_conn_stop: Some(net_conn_stop_tx),
+            client_tx,
+            server_rx,
+            watch_close: watch_close_tx,
             closed: false,
         })
     }
 
-    async fn input(&mut self, event: X11Event) -> Result<(), VncError> {
+    pub fn ensure_alive(&self) -> Result<(), VncError> {
         if self.closed {
             Err(VncError::ClientNotRunning)
         } else {
-            let msg = match event {
-                X11Event::Refresh => ClientMsg::FramebufferUpdateRequest(
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: self.screen.0,
-                        height: self.screen.1,
-                    },
-                    1,
-                ),
-                X11Event::KeyEvent(key) => ClientMsg::KeyEvent(key.keycode, key.down),
-                X11Event::PointerEvent(mouse) => {
-                    ClientMsg::PointerEvent(mouse.position_x, mouse.position_y, mouse.bottons)
-                }
-                X11Event::CopyText(text) => ClientMsg::ClientCutText(text),
-            };
-            self.input_ch.send(msg).await?;
             Ok(())
         }
     }
 
-    async fn recv_event(&mut self) -> Result<VncEvent, VncError> {
-        if self.closed {
-            Err(VncError::ClientNotRunning)
-        } else {
-            match self.output_ch.recv().await {
-                Some(e) => Ok(e),
-                None => {
-                    self.closed = true;
-                    Err(VncError::ClientNotRunning)
-                }
+    pub async fn send(&mut self, event: ClientEvent) -> Result<(), VncError> {
+        self.ensure_alive()?;
+        self.client_tx.send(event).await?;
+        Ok(())
+    }
+
+    pub fn blocking_send(&mut self, event: ClientEvent) -> Result<(), VncError> {
+        self.ensure_alive()?;
+        self.client_tx.blocking_send(event)?;
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Result<VncEvent, VncError> {
+        self.ensure_alive()?;
+        match self.server_rx.recv().await {
+            Some(e) => Ok(e),
+            None => {
+                self.closed = true;
+                Err(VncError::ClientNotRunning)
             }
         }
     }
 
-    async fn poll_event(&mut self) -> Result<Option<VncEvent>, VncError> {
-        if self.closed {
-            Err(VncError::ClientNotRunning)
-        } else {
-            match self.output_ch.try_recv() {
-                Err(TryRecvError::Disconnected) => {
-                    self.closed = true;
-                    Err(VncError::ClientNotRunning)
-                }
-                Err(TryRecvError::Empty) => Ok(None),
-                Ok(e) => Ok(Some(e)),
+    pub async fn recv_many(&mut self, buffer: &mut Vec<VncEvent>) -> Result<usize, VncError> {
+        self.ensure_alive()?;
+        Ok(self.server_rx.recv_many(buffer, 0).await)
+    }
+
+    pub fn try_recv(&mut self) -> Result<Option<VncEvent>, VncError> {
+        self.ensure_alive()?;
+        match self.server_rx.try_recv() {
+            Err(TryRecvError::Disconnected) => {
+                self.closed = true;
+                Err(VncError::ClientNotRunning)
             }
-            // Ok(self.output_ch.recv().await)
+            Err(TryRecvError::Empty) => Ok(None),
+            Ok(e) => Ok(Some(e)),
         }
+        // Ok(self.output_ch.recv().await)
     }
 
     /// Stop the VNC engine and release resources
-    ///
-    fn close(&mut self) -> Result<(), VncError> {
-        if self.net_conn_stop.is_some() {
-            let net_conn_stop: oneshot::Sender<()> = self.net_conn_stop.take().unwrap();
-            let _ = net_conn_stop.send(());
-        }
-        if self.decoding_stop.is_some() {
-            let decoding_stop = self.decoding_stop.take().unwrap();
-            let _ = decoding_stop.send(());
-        }
+    pub fn close(&mut self) -> Result<(), VncError> {
         self.closed = true;
+        self.watch_close.send_modify(|i| *i = true);
         Ok(())
     }
 }
 
-impl Drop for VncInner {
+impl Drop for VncClient {
     fn drop(&mut self) {
         info!("VNC Client {} stops", self.name);
         let _ = self.close();
-    }
-}
-
-pub struct VncClient {
-    inner: Arc<Mutex<VncInner>>,
-}
-
-impl VncClient {
-    pub(super) async fn new<S>(
-        stream: S,
-        shared: bool,
-        pixel_format: Option<PixelFormat>,
-        encodings: Vec<VncEncoding>,
-    ) -> Result<Self, VncError>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings).await?,
-            )),
-        })
-    }
-
-    /// Input a `X11Event` from the frontend
-    ///
-    pub async fn input(&self, event: X11Event) -> Result<(), VncError> {
-        self.inner.lock().await.input(event).await
-    }
-
-    /// Receive a `VncEvent` from the engine
-    /// This function will block until a `VncEvent` is received
-    ///
-    pub async fn recv_event(&self) -> Result<VncEvent, VncError> {
-        self.inner.lock().await.recv_event().await
-    }
-
-    /// polling `VncEvent` from the engine and give it to the client
-    ///
-    pub async fn poll_event(&self) -> Result<Option<VncEvent>, VncError> {
-        self.inner.lock().await.poll_event().await
-    }
-
-    /// Stop the VNC engine and release resources
-    ///
-    pub async fn close(&self) -> Result<(), VncError> {
-        self.inner.lock().await.close()
-    }
-}
-
-impl Clone for VncClient {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
     }
 }
 
@@ -312,15 +215,13 @@ where
     Ok(())
 }
 
-async fn read_server_init<S, F, Fut>(
+async fn read_server_init<S>(
     stream: &mut S,
     pf: &mut Option<PixelFormat>,
-    output_func: &F,
+    output_channel: &Sender<VncEvent>,
 ) -> Result<(String, (u16, u16)), VncError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: Fn(VncEvent) -> Fut,
-    Fut: Future<Output = Result<(), VncError>>,
 {
     // +--------------+--------------+------------------------------+
     // | No. of bytes | Type [Value] | Description                  |
@@ -334,19 +235,21 @@ where
 
     let screen_width = stream.read_u16().await?;
     let screen_height = stream.read_u16().await?;
-    let mut send_our_pf = false;
 
-    output_func(VncEvent::SetResolution(
+    output_channel.send(VncEvent::SetResolution(
         (screen_width, screen_height).into(),
     ))
     .await?;
 
     let pixel_format = PixelFormat::read(stream).await?;
-    if pf.is_none() {
-        output_func(VncEvent::SetPixelFormat(pixel_format)).await?;
-        let _ = pf.insert(pixel_format);
+    if let Some(pf) = pf.as_ref() {
+        trace!("Send customized pixel format {:#?}", pf);
+        ClientMsg::SetPixelFormat(*pf)
+            .write(stream)
+            .await?;
     } else {
-        send_our_pf = true;
+        output_channel.send(VncEvent::SetPixelFormat(pixel_format)).await?;
+        let _ = pf.insert(pixel_format);
     }
 
     let name_len = stream.read_u32().await?;
@@ -354,12 +257,6 @@ where
     stream.read_exact(&mut name_buf).await?;
     let name = String::from_utf8_lossy(&name_buf).into_owned();
 
-    if send_our_pf {
-        trace!("Send customized pixel format {:#?}", pf);
-        ClientMsg::SetPixelFormat(*pf.as_ref().unwrap())
-            .write(stream)
-            .await?;
-    }
     Ok((name, (screen_width, screen_height)))
 }
 
@@ -374,90 +271,113 @@ where
     Ok(())
 }
 
-async fn asycn_vnc_read_loop<S, F, Fut>(
-    stream: &mut S,
-    pf: &PixelFormat,
-    output_func: &F,
-    mut stop_ch: oneshot::Receiver<()>,
-) -> Result<(), VncError>
-where
-    S: AsyncRead + Unpin,
-    F: Fn(VncEvent) -> Fut,
-    Fut: Future<Output = Result<(), VncError>>,
-{
-    let mut raw_decoder = codec::RawDecoder::new();
-    let mut zrle_decoder = codec::ZrleDecoder::new();
-    let mut tight_decoder = codec::TightDecoder::new();
-    let mut trle_decoder = codec::TrleDecoder::new();
-    let mut cursor = codec::CursorDecoder::new();
+struct Reader<A: Allocator = Global> {
+    allocator: A,
+    frames: Vec<VncImageEvent>,
+    raw_decoder: codec::RawDecoder,
+    zrle_decoder: codec::ZrleDecoder,
+    tight_decoder: codec::TightDecoder,
+    trle_decoder: codec::TrleDecoder,
+    cursor: codec::CursorDecoder,
+}
 
-    // main decoding loop
-    while let Err(oneshot::error::TryRecvError::Empty) = stop_ch.try_recv() {
+impl Reader<Global> {
+    pub fn new() -> Self {
+        Self::new_in(Global)
+    }
+}
+
+impl<A> Reader<A> where A: Allocator {
+    pub fn new_in(allocator: A) -> Self {
+        Self {
+            allocator,
+            frames: Vec::new(),
+            raw_decoder: codec::RawDecoder::new(),
+            zrle_decoder: codec::ZrleDecoder::new(),
+            tight_decoder: codec::TightDecoder::new(),
+            trle_decoder: codec::TrleDecoder::new(),
+            cursor: codec::CursorDecoder::new(),
+        }
+    }
+    async fn read_vnc_event<S>(
+        &mut self,
+        stream: &mut S,
+        pf: &PixelFormat,
+        output_channel: &Sender<VncEvent>,
+    ) -> Result<(), VncError>
+where
+        S: AsyncRead + Unpin {
         let server_msg = ServerMsg::read(stream).await?;
-        trace!("Server message got: {:?}", server_msg);
+        debug!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
-                for _ in 0..rect_num {
-                    let rect = ImageRect::read(stream).await?;
-                    // trace!("Encoding: {:?}", rect.encoding);
-
-                    match rect.encoding {
-                        VncEncoding::Raw => {
-                            raw_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
-                        }
-                        VncEncoding::CopyRect => {
-                            let source_x = stream.read_u16().await?;
-                            let source_y = stream.read_u16().await?;
-                            let mut src_rect = rect.rect;
-                            src_rect.x = source_x;
-                            src_rect.y = source_y;
-                            output_func(VncEvent::Copy(rect.rect, src_rect)).await?;
-                        }
-                        VncEncoding::Tight => {
-                            tight_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
-                        }
-                        VncEncoding::Trle => {
-                            trle_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
-                        }
-                        VncEncoding::Zrle => {
-                            zrle_decoder
-                                .decode(pf, &rect.rect, stream, output_func)
-                                .await?;
-                        }
-                        VncEncoding::CursorPseudo => {
-                            cursor.decode(pf, &rect.rect, stream, output_func).await?;
-                        }
-                        VncEncoding::DesktopSizePseudo => {
-                            output_func(VncEvent::SetResolution(
-                                (rect.rect.width, rect.rect.height).into(),
-                            ))
-                            .await?;
-                        }
-                        VncEncoding::LastRectPseudo => {
-                            break;
-                        }
-                    }
-                }
+                self.decode_framebuffer_update(pf, stream, rect_num, &output_channel).await?
             }
             // SetColorMapEntries,
             ServerMsg::Bell => {
-                output_func(VncEvent::Bell).await?;
+                output_channel.send(VncEvent::Bell).await?;
             }
             ServerMsg::ServerCutText(text) => {
-                output_func(VncEvent::Text(text)).await?;
+                output_channel.send(VncEvent::Text(text)).await?;
             }
-        }
+        };
+        Ok(())
     }
-    Ok(())
+    async fn decode_framebuffer_update<S>(
+        &mut self,
+        pf: &PixelFormat,
+        stream: &mut S,
+        rect_num: u16,
+        output_channel: &Sender<VncEvent>,
+    ) -> Result<(), VncError>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut frames = &mut self.frames;
+        frames.reserve(rect_num as usize);
+        debug!("Received {} frames from the server", rect_num);
+        for i in 0..rect_num {
+            let rect = ImageRect::read(stream).await?;
+            trace!("Encoding of {}: {:?}", i, rect.encoding);
+
+            match rect.encoding {
+                VncEncoding::Raw => {
+                    let image = self.raw_decoder.decode(pf, &rect.rect, stream).await?;
+                    frames.push(VncImageEvent::RawImage(image));
+                }
+                VncEncoding::CopyRect => {
+                    let source_x = stream.read_u16().await?;
+                    let source_y = stream.read_u16().await?;
+                    let mut src_rect = rect.rect;
+                    src_rect.x = source_x;
+                    src_rect.y = source_y;
+                    frames.push(VncImageEvent::Copy(rect.rect, src_rect))
+                }
+                VncEncoding::Tight => frames.push(self.tight_decoder.decode(pf, &rect.rect, stream).await?),
+                VncEncoding::Trle => {
+                    self.trle_decoder
+                        .decode(pf, &rect.rect, stream, &mut frames)
+                        .await?;
+                }
+                VncEncoding::Zrle => {
+                    self.zrle_decoder
+                        .decode(pf, &rect.rect, stream, &mut frames)
+                        .await?;
+                }
+                VncEncoding::CursorPseudo => output_channel.send(self.cursor.decode(pf, &rect.rect, stream).await?).await? ,
+                VncEncoding::DesktopSizePseudo => output_channel.send(VncEvent::SetResolution((rect.rect.width, rect.rect.height).into())).await?,
+                VncEncoding::LastRectPseudo => {
+                    break;
+                }
+            };
+        }
+        debug!("Sending {} frames", frames.len());
+        output_channel.send(VncEvent::ImageEvent(frames.split_off(0))).await?;
+        Ok(())
+    }
 }
 
-async fn async_connection_process_loop<S>(
+/* async fn async_connection_process_loop<S>(
     mut stream: S,
     mut input_ch: Receiver<ClientMsg>,
     conn_ch: Sender<std::io::Result<Vec<u8>>>,
@@ -515,4 +435,4 @@ where
         .await;
 
     Ok(())
-}
+} */

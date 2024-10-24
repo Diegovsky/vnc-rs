@@ -1,4 +1,4 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
+use crate::{PixelFormat, Rect, VncError, VncImageEvent};
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::error;
@@ -44,6 +44,11 @@ fn copy_indexed(palette: &[u8], pixels: &mut Vec<u8>, bpp: usize, index: u8) {
     pixels.extend_from_slice(&palette[start..start + bpp])
 }
 
+/// TRLE stands for Tiled Run-Length Encoding, and combines tiling, palettisation and run-length
+/// encoding. The rectangle is divided into tiles of 16x16 pixels in left-to-right, top-to-bottom
+/// order. (RFP Protocol specification)
+///
+/// It is a complex encoding because it combines a bunch of "sub-encodings".
 pub struct Decoder {}
 
 impl Decoder {
@@ -51,19 +56,21 @@ impl Decoder {
         Self {}
     }
 
-    pub async fn decode<S, F, Fut>(
-        &mut self,
+    pub async fn decode<S>(
+        &self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
+        frames: &mut Vec<VncImageEvent>
     ) -> Result<(), VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
+        // The length part of the "Run-Length Encoding".
         let data_len = input.read_u32().await? as usize;
+
+        // TODO: instead of always allocating, create
+        // and reuse a Vec stored in the `Decoder struct`
         let mut zlib_data = uninit_vec(data_len);
         input.read_exact(&mut zlib_data).await?;
 
@@ -77,7 +84,7 @@ impl Decoder {
                 if pixel_mask & 0x000000ff == 0 {
                     // rgb at the most significant bits
                     // if format.big_endian_flag is set
-                    // then decompressed data is excepted to be [rgb.0, rgb.1, rgb.2, alpha]
+                    // then decompressed data is expected to be [rgb.0, rgb.1, rgb.2, alpha]
                     // otherwise the decompressed data should be [alpha, rgb.0, rgb.1, rgb.2]
                     (3, format.big_endian_flag == 0)
                 } else if pixel_mask & 0xff000000 == 0 {
@@ -92,6 +99,7 @@ impl Decoder {
             } else {
                 (bpp, false)
             };
+        // TODO: Do the same here.
         let mut palette = Vec::with_capacity(128 * bpp);
 
         let mut y = 0;
@@ -116,8 +124,13 @@ impl Decoder {
                 palette.truncate(0);
 
                 for _ in 0..palette_size {
-                    copy_true_color(input, &mut palette, alpha_at_first, compressed_bpp, bpp)
-                        .await?
+                    copy_true_color(
+                        input,
+                        &mut palette,
+                        alpha_at_first,
+                        compressed_bpp,
+                        bpp,
+                    ).await?
                 }
 
                 let mut pixels = Vec::with_capacity(pixel_count * bpp);
@@ -125,8 +138,13 @@ impl Decoder {
                     (false, 0) => {
                         // True Color pixels
                         for _ in 0..pixel_count {
-                            copy_true_color(input, &mut pixels, alpha_at_first, compressed_bpp, bpp)
-                                .await?
+                            copy_true_color(
+                                input,
+                                &mut pixels,
+                                alpha_at_first,
+                                compressed_bpp,
+                                bpp,
+                            ).await?
                         }
                     }
                     (false, 1) => {
@@ -169,8 +187,13 @@ impl Decoder {
                         let mut pixel = Vec::new();
                         while count < pixel_count {
                             pixel.truncate(0);
-                            copy_true_color(input, &mut pixel, alpha_at_first, compressed_bpp, bpp)
-                                .await?;
+                            copy_true_color(
+                                input,
+                                &mut pixel,
+                                alpha_at_first,
+                                compressed_bpp,
+                                bpp,
+                            ).await?;
                             let run_length = read_run_length(input).await?;
                             for _ in 0..run_length {
                                 pixels.extend(&pixel)
@@ -201,16 +224,15 @@ impl Decoder {
                         return Err(VncError::InvalidImageData);
                     }
                 }
-                output_func(VncEvent::RawImage(
-                    Rect {
+                frames.push(VncImageEvent::RawImage(
+                    crate::ImageData::new(Rect {
                         x: rect.x + x,
                         y: rect.y + y,
                         width,
                         height,
                     },
-                    pixels,
-                ))
-                .await?;
+                    pixels)
+                ));
                 x += width;
             }
             y += height;

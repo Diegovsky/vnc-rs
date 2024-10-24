@@ -11,17 +11,14 @@ impl Decoder {
         Self {}
     }
 
-    pub async fn decode<S, F, Fut>(
+    pub async fn decode<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<crate::ImageData, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         // +----------------------------+--------------+-------------+
         // | No. of bytes               | Type [Value] | Description |
@@ -32,7 +29,6 @@ impl Decoder {
         let buffer_size = bpp as usize * rect.height as usize * rect.width as usize;
         let mut pixels = uninit_vec(buffer_size);
         input.read_exact(&mut pixels).await?;
-        output_func(VncEvent::RawImage(*rect, pixels)).await?;
-        Ok(())
+        Ok(crate::ImageData::new(*rect, pixels))
     }
 }

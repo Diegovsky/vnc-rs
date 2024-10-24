@@ -1,8 +1,7 @@
-use crate::{PixelFormat, Rect, VncError, VncEvent};
-use std::future::Future;
+use crate::{ImageData, PixelFormat, Rect, VncError, VncImageEvent};
 use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::error;
+use tracing::{error, trace};
 
 use super::{uninit_vec, zlib::ZlibReader};
 
@@ -19,28 +18,21 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
-        let mut new = Self {
+        Self {
             palette: Vec::with_capacity(MAX_PALETTE * 4),
+            zlibs: std::array::from_fn(|_| Some(flate2::Decompress::new(true))),
             ..Default::default()
-        };
-        for i in 0..4 {
-            let decompressor = flate2::Decompress::new(true);
-            new.zlibs[i] = Some(decompressor);
         }
-        new
     }
 
-    pub async fn decode<S, F, Fut>(
+    pub async fn decode<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let pixel_mask = (format.red_max as u32) << format.red_shift
             | (format.green_max as u32) << format.green_shift
@@ -66,12 +58,14 @@ impl Decoder {
 
         match self.ctrl {
             8 => {
+                trace!("Fill rect");
                 // fill Rect
-                self.fill_rect(format, rect, input, output_func).await
+                self.fill_rect(format, rect, input).await
             }
             9 => {
+                trace!("Jpeg rect");
                 // jpeg Rect
-                self.jpeg_rect(format, rect, input, output_func).await
+                self.jpeg_rect(format, rect, input).await
             }
             10 => {
                 // png Rect
@@ -79,8 +73,9 @@ impl Decoder {
                 Err(VncError::InvalidImageData)
             }
             x if x & 0x8 == 0 => {
+                trace!("Basic rect");
                 // basic Rect
-                self.basic_rect(format, rect, input, output_func).await
+                self.basic_rect(format, rect, input).await
             }
             _ => {
                 error!("Illegal tight compression received ({})", self.ctrl);
@@ -113,17 +108,14 @@ impl Decoder {
         Ok(data)
     }
 
-    async fn fill_rect<S, F, Fut>(
+    async fn fill_rect<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let mut color = [0; 3];
         input.read_exact(&mut color).await?;
@@ -137,38 +129,30 @@ impl Decoder {
                 image.extend_from_slice(&true_color);
             }
         }
-        output_func(VncEvent::RawImage(*rect, image)).await?;
-        Ok(())
+        Ok(VncImageEvent::RawImage(ImageData::new(*rect, image)))
     }
 
-    async fn jpeg_rect<S, F, Fut>(
+    async fn jpeg_rect<S>(
         &mut self,
         _format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let data = self.read_data(input).await?;
-        output_func(VncEvent::JpegImage(*rect, data)).await?;
-        Ok(())
+        Ok(VncImageEvent::JpegImage(ImageData::new(*rect, data)))
     }
 
-    async fn basic_rect<S, F, Fut>(
+    async fn basic_rect<S>(
         &mut self,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         self.filter = {
             if self.ctrl & 0x4 == 4 {
@@ -179,20 +163,21 @@ impl Decoder {
         };
 
         let stream_id = self.ctrl & 0x3;
+        trace!("Filter: {}", self.filter);
         match self.filter {
             0 => {
                 // copy filter
-                self.copy_filter(stream_id, format, rect, input, output_func)
+                self.copy_filter(stream_id, format, rect, input)
                     .await
             }
             1 => {
                 // palette
-                self.palette_filter(stream_id, format, rect, input, output_func)
+                self.palette_filter(stream_id, format, rect, input)
                     .await
             }
             2 => {
                 // gradient
-                self.gradient_filter(stream_id, format, rect, input, output_func)
+                self.gradient_filter(stream_id, format, rect, input)
                     .await
             }
             _ => {
@@ -202,22 +187,19 @@ impl Decoder {
         }
     }
 
-    async fn copy_filter<S, F, Fut>(
+    async fn copy_filter<S>(
         &mut self,
         stream: u8,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let uncompressed_size = rect.width as usize * rect.height as usize * 3;
         if uncompressed_size == 0 {
-            return Ok(());
+            unreachable!("Got zero-sized rectangle");
         };
 
         let data = self
@@ -230,23 +212,18 @@ impl Decoder {
             j += 3;
         }
 
-        output_func(VncEvent::RawImage(*rect, image)).await?;
-
-        Ok(())
+        Ok(VncImageEvent::RawImage(ImageData::new(*rect, image)))
     }
 
-    async fn palette_filter<S, F, Fut>(
+    async fn palette_filter<S>(
         &mut self,
         stream: u8,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let num_colors = input.read_u8().await? as usize + 1;
         let palette_size = num_colors * 3;
@@ -259,7 +236,7 @@ impl Decoder {
         let uncompressed_size = rect.height as usize * row_size;
 
         if uncompressed_size == 0 {
-            return Ok(());
+            unreachable!("Got zero-sized-pellete");
         }
 
         let data = self
@@ -267,24 +244,20 @@ impl Decoder {
             .await?;
 
         if num_colors == 2 {
-            self.mono_rect(data, rect, format, output_func).await?
+            self.mono_rect(data, rect, format).await
         } else {
-            self.palette_rect(data, rect, format, output_func).await?
+            self.palette_rect(data, rect, format).await
         }
 
-        Ok(())
     }
 
-    async fn mono_rect<F, Fut>(
+    async fn mono_rect(
         &mut self,
         data: Vec<u8>,
         rect: &Rect,
         format: &PixelFormat,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         // Convert indexed (palette based) image data to RGB
         let total = rect.width as usize * rect.height as usize;
@@ -305,20 +278,16 @@ impl Decoder {
             }
             dp += 4;
         }
-        output_func(VncEvent::RawImage(*rect, image)).await?;
-        Ok(())
+        Ok(VncImageEvent::RawImage(ImageData::new(*rect, image)))
     }
 
-    async fn palette_rect<F, Fut>(
+    async fn palette_rect(
         &mut self,
         data: Vec<u8>,
         rect: &Rect,
         format: &PixelFormat,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         // Convert indexed (palette based) image data to RGB
         let total = rect.width as usize * rect.height as usize;
@@ -334,26 +303,22 @@ impl Decoder {
             dp += 4;
             i += 1;
         }
-        output_func(VncEvent::RawImage(*rect, image)).await?;
-        Ok(())
+        Ok(VncImageEvent::RawImage(ImageData::new(*rect, image)))
     }
 
-    async fn gradient_filter<S, F, Fut>(
+    async fn gradient_filter<S>(
         &mut self,
         stream: u8,
         format: &PixelFormat,
         rect: &Rect,
         input: &mut S,
-        output_func: &F,
-    ) -> Result<(), VncError>
+    ) -> Result<VncImageEvent, VncError>
     where
         S: AsyncRead + Unpin,
-        F: Fn(VncEvent) -> Fut,
-        Fut: Future<Output = Result<(), VncError>>,
     {
         let uncompressed_size = rect.width as usize * rect.height as usize * 3;
         if uncompressed_size == 0 {
-            return Ok(());
+            unreachable!("Got zero-sized rectangle") 
         };
         let data = self
             .read_tight_data(stream, input, uncompressed_size)
@@ -404,8 +369,7 @@ impl Decoder {
             }
         }
 
-        output_func(VncEvent::RawImage(*rect, image)).await?;
-        Ok(())
+        Ok(VncImageEvent::RawImage(ImageData::new(*rect, image)))
     }
 
     async fn read_tight_data<S>(

@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+#![feature(try_blocks)]
 //! # VNC-RS
 //!
 //! ## Description
